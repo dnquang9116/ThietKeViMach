@@ -1,0 +1,176 @@
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Sử dụng backend không cần GUI
+import matplotlib.pyplot as plt
+import pygad
+
+# --- Mẫu 0: TRAFFIC THƯỜNG (NORMAL) ---
+# IP tập trung (0.1), Tốc độ thấp (0.2), Flags ổn định (0.3), Trễ thấp (0.1)
+normal_pattern = np.array([0.1, 0.2, 0.3, 0.1])
+
+# --- Mẫu 1: TẤN CÔNG DDoS (DDOS) ---
+# IP phân tán (0.9), Tốc độ cực cao (1.0), Flags bất thường (SYN, 0.8), Trễ cao (0.7)
+ddos_pattern = np.array([0.9, 1.0, 0.8, 0.7])
+
+# Ma trận dữ liệu nạp vào GA (Cấu trúc nhiều mẫu, mỗi mẫu 4 đặc trưng)
+# Thêm nhiều mẫu với noise để GA học tốt hơn
+normal_samples = [normal_pattern + np.random.normal(0, 0.05, 4) for _ in range(3)]
+ddos_samples = [ddos_pattern + np.random.normal(0, 0.05, 4) for _ in range(3)]
+data_ddos = np.array(normal_samples + ddos_samples)
+labels = [0]*3 + [1]*3  # 0: Normal, 1: DDoS
+
+# --- Cấu hình nơ-ron LIF (Giống thiết kế trên FPGA) ---
+def snn_with_inhibition(input_spikes, weights, threshold=2, decay=0.6, v_inh=4):
+    # weights bây giờ là ma trận (4x2)
+    v = np.array([0.0, 0.0])      # Điện thế của 2 nơ-ron [v0, v1]
+    spike_counts = np.array([0, 0]) # Đếm số xung của mỗi nơ-ron
+    spikes_history = []           # Để vẽ biểu đồ sau này
+    
+    for t in range(len(input_spikes)): # Duyệt qua từng bước thời gian
+        # 1. Rò rỉ (Decay)
+        v = v * decay
+        
+        # 2. Tích lũy (Integrate) - Nhân input với cột trọng số tương ứng
+        v += np.dot(input_spikes[t], weights) # Tích lũy điện thế từ 4 đặc trưng đầu vào với trọng số của từng nơ-ron
+        
+        # 3. Kiểm tra phát xung & Ức chế chéo (Lateral Inhibition)
+        s0 = 1 if v[0] >= threshold else 0 
+        s1 = 1 if v[1] >= threshold else 0
+        
+        # Nếu cả hai cùng muốn phát xung, ta có thể dùng logic ưu tiên 
+        # hoặc cho chúng ức chế lẫn nhau
+        if s0:
+            v[0] = 0          # Reset nơ-ron 0
+            v[1] =max(0, v[1] - v_inh) # ỨC CHẾ: Giảm điện thế nơ-ron 1
+            spike_counts[0] += 1
+            
+        if s1:
+            v[1] = 0          # Reset nơ-ron 1
+            v[0] =max(0, v[0] - v_inh)     # ỨC CHẾ: Giảm điện thế nơ-ron 0
+            spike_counts[1] += 1
+            
+        spikes_history.append([s0, s1])
+        
+    return spike_counts, np.array(spikes_history) # Trả về số xung và lịch sử xung để vẽ biểu đồ sau này
+
+
+# Tạo chuỗi xung giả lập (Rate coding)
+def get_input_spikes(pattern, time=300):
+    return (np.random.rand(time, 4) < pattern).astype(float)  # Tăng tần số, tối đa 100%
+
+# --- Hàm Fitness cho GA ---
+def fitness_func(ga_instance, solution, solution_idx):
+    weights = solution.reshape(4, 2) # Chuyển vector trọng số thành ma trận 4x2
+    total_fitness = 0 # Điểm số tối đa lý thuyết là 24 (10 điểm cho mỗi mẫu đúng + 2 điểm thưởng nếu nơ-ron đối lập hoàn toàn im lặng) x 2 mẫu = 48 điểm
+    
+    for i in range(len(data_ddos)):
+        # Chạy nhiều lần để trung bình hóa do ngẫu nhiên
+        spike_counts_avg = np.zeros(2) # Trung bình số xung của 2 nơ-ron
+        overlap_total = 0 # Tổng số lần cả 2 nơ-ron cùng phát xung (để phạt nếu có quá nhiều overlap)
+        for _ in range(3):  # Giảm để nhanh
+            in_spikes = get_input_spikes(data_ddos[i], time=200)
+            spike_counts, s_history = snn_with_inhibition(in_spikes, weights)
+            spike_counts_avg += spike_counts
+            overlap_total += np.sum(np.logical_and(s_history[:, 0], s_history[:, 1]))
+        spike_counts_avg /= 3
+        c0, c1 = spike_counts_avg
+        overlap_count = overlap_total / 3
+        
+        # Debug: in ra spike counts trung bình
+        # if solution_idx == 0 and ga_instance.generations_completed % 20 == 0 and i < 2:  # In mỗi 20 thế hệ cho 2 mẫu đầu
+        #     print(f"Gen {ga_instance.generations_completed}, Sample {i}: c0={c0:.1f}, c1={c1:.1f}")
+        
+        # --- PHẦN 1: ĐIỂM ĐOÁN ĐÚNG (Căn bản) ---
+        prediction = 0 if c0 > c1 else (1 if c1 > c0 else -1)
+        if prediction == labels[i]:
+            total_fitness += 10.0  # Tăng lên 10 điểm cho mỗi mẫu đúng -> Tổng 20
+            
+            # --- PHẦN 2: ĐIỂM THƯỞNG (BONUS) ---
+            # Thưởng nếu nơ-ron sai im lặng hoàn toàn (Độ tin cậy tuyệt đối)
+            if labels[i] == 0 and c1 == 0:
+                total_fitness += 2.0 # Thưởng 2 điểm -> Tổng cộng có thể lên 12/mẫu
+            if labels[i] == 1 and c0 == 0:
+                total_fitness += 2.0
+        
+        # --- PHẦN 3: PHẠT (Giữ nguyên hoặc tăng nặng) ---
+        elif prediction != -1: # Nếu dự đoán sai (không phải trường hợp tie), phạt nặng hơn nếu có quá nhiều overlap
+            pass
+        
+    return max(0, total_fitness)
+
+# --- Chạy GA ---
+ga = pygad.GA(num_generations=10, num_parents_mating=2, 
+              fitness_func=fitness_func, sol_per_pop=50, num_genes=8,mutation_num_genes=2,
+              init_range_low= -5, init_range_high= 5, gene_type=float)
+
+print("Đang tiến hóa bộ trọng số SNN...")
+ga.run()
+
+# --- HIỂN THỊ KẾT QUẢ ---
+solution, fitness, _ = ga.best_solution()
+print(f"Hoàn tất! Fitness tốt nhất: {fitness}")
+
+# Tính accuracy
+MAX_FITNESS = 72 
+accuracy_pct = (fitness / MAX_FITNESS) * 100
+print(f"Độ hiệu quả của Chip: {accuracy_pct:.1f}%")
+
+# Tạo luồng dữ liệu kép
+spikes_normal = get_input_spikes(data_ddos[0], time=250) # Mẫu 0
+spikes_ddos = get_input_spikes(data_ddos[3], time=250)   # Mẫu 1
+# Nối lại thành 1 chuỗi dài 500ms
+full_stream = np.vstack((spikes_normal, spikes_ddos))
+
+# Cho chip chạy một lèo qua 500ms này
+counts, history = snn_with_inhibition(full_stream, solution.reshape(4, 2))
+
+# Tách lịch sử xung của 2 nơ-ron để vẽ
+s0 = history[:, 0]
+s1 = history[:, 1]
+
+plt.figure(figsize=(12, 8))
+
+# Subplot 1: Spike history
+plt.subplot(3, 1, 1)
+plt.eventplot([np.where(s0)[0], np.where(s1)[0]], colors=['r', 'b'], lineoffsets=[0, 1])
+plt.axvline(x=250, color='k', linestyle='--', label='Chuyển từ Normal sang DDoS')
+plt.title(f"Biểu đồ xung đầu ra (Độ hiệu quả: {accuracy_pct:.1f}%)")
+plt.ylabel("Nơ-ron")
+plt.legend(["Nơ-ron 0 (Normal)", "Nơ-ron 1 (DDoS)", "Giới hạn Normal/DDoS"])
+plt.ylim(-0.5, 1.5)
+
+# Subplot 2: Input spikes
+plt.subplot(3, 1, 2)
+plt.imshow(full_stream.T, aspect='auto', cmap='Greys')
+plt.axvline(x=250, color='k', linestyle='--')
+plt.title("Xung đầu vào (4 đặc trưng)")
+plt.xlabel("Thời gian (ms)")
+
+# Subplot 3: Spike counts comparison
+plt.subplot(3, 1, 3)
+normal_counts = counts[:250]  # Approximate, but actually counts is total
+ddos_counts = counts[250:]
+# Better: calculate counts for each part
+normal_spikes = full_stream[:250]
+ddos_spikes = full_stream[250:]
+_, normal_history = snn_with_inhibition(normal_spikes, solution.reshape(4, 2))
+_, ddos_history = snn_with_inhibition(ddos_spikes, solution.reshape(4, 2))
+normal_count_0 = np.sum(normal_history[:, 0])
+normal_count_1 = np.sum(normal_history[:, 1])
+ddos_count_0 = np.sum(ddos_history[:, 0])
+ddos_count_1 = np.sum(ddos_history[:, 1])
+
+labels = ['Normal', 'DDoS']
+n0 = [normal_count_0, ddos_count_0]
+n1 = [normal_count_1, ddos_count_1]
+x = np.arange(len(labels))
+plt.bar(x - 0.2, n0, 0.4, label='Nơ-ron 0', color='red')
+plt.bar(x + 0.2, n1, 0.4, label='Nơ-ron 1', color='blue')
+plt.xlabel('Loại traffic')
+plt.ylabel('Số xung')
+plt.title('So sánh số xung giữa Normal và DDoS')
+plt.xticks(x, labels)
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('snn_output.png', dpi=150)
